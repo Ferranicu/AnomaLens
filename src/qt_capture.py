@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .imageio import center_square_view
+from .duck_detector import detect_ducks, square_crop
 
 
 class CaptureWorker(QObject):
@@ -47,13 +47,22 @@ class CaptureWorker(QObject):
                 ok, frame = cap.read()
                 if not ok:
                     continue
-                crop, (cx0, cy0, cs) = center_square_view(frame)
+                boxes = detect_ducks(frame)
                 display = frame.copy()
-                cv2.rectangle(display, (cx0, cy0), (cx0 + cs, cy0 + cs), (0, 255, 0), 2)
+                for box in boxes:
+                    _, (cx0, cy0, cs) = square_crop(frame, box)
+                    cv2.rectangle(display, (cx0, cy0), (cx0 + cs, cy0 + cs), (0, 255, 0), 2)
+                if not boxes:
+                    cv2.putText(display, 'no ducks detected', (20, 50),
+                                cv2.FONT_HERSHEY_DUPLEX, 0.9, (80, 80, 200), 2, cv2.LINE_AA)
+                n = len(boxes)
+                cv2.putText(display, f'ducks: {n}', (20, display.shape[0] - 16),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 220, 0) if n else (80, 80, 200),
+                            1, cv2.LINE_AA)
                 rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb.shape
                 qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
-                self.frame_ready.emit(qimg, crop.copy())
+                self.frame_ready.emit(qimg, (frame.copy(), boxes))
         finally:
             cap.release()
             self.finished.emit()
@@ -65,7 +74,7 @@ class CaptureScreen(QWidget):
 
     def __init__(self, default_out: str = 'dataset/good', default_camera: int = 0):
         super().__init__()
-        self.latest_crop = None
+        self.latest_data: tuple | None = None  # (frame_bgr, list[DuckBox])
         self.worker: CaptureWorker | None = None
         self.thread: QThread | None = None
         self.flash_until = 0.0
@@ -121,9 +130,9 @@ class CaptureScreen(QWidget):
         self.save_btn.clicked.connect(self.on_save)
 
         self.hint = QLabel(
-            'Hold the duck inside the green box.\n'
-            'Vary yaw / position / distance between shots.\n'
-            'Press SPACE or click Save.'
+            'Place 1–3 ducks on the table.\n'
+            'Vary count, position, distance between shots.\n'
+            'Each detected duck is saved separately.'
         )
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet('color: #686890; font-size: 12px;')
@@ -198,8 +207,8 @@ class CaptureScreen(QWidget):
         self.error.emit(msg)
 
     @pyqtSlot(QImage, object)
-    def on_frame(self, qimg: QImage, crop) -> None:
-        self.latest_crop = crop
+    def on_frame(self, qimg: QImage, data) -> None:
+        self.latest_data = data
         pix = QPixmap.fromImage(qimg).scaled(
             self.video_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
@@ -213,14 +222,21 @@ class CaptureScreen(QWidget):
             self.video_label.setStyleSheet('background:#101010;')
 
     def on_save(self) -> None:
-        if self.latest_crop is None:
+        if self.latest_data is None:
             self.status_message.emit('No frame yet.', 2000)
+            return
+        frame, boxes = self.latest_data
+        if not boxes:
+            self.status_message.emit('No ducks detected — nothing saved.', 2000)
             return
         out = Path(self.out_edit.text().strip())
         out.mkdir(parents=True, exist_ok=True)
-        idx = len(list(out.glob('*.jpg')))
-        fname = out / f'good_{idx:04d}.jpg'
-        cv2.imwrite(str(fname), self.latest_crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        base_idx = len(list(out.glob('*.jpg')))
+        for i, box in enumerate(boxes):
+            crop, _ = square_crop(frame, box)
+            fname = out / f'good_{base_idx + i:04d}.jpg'
+            cv2.imwrite(str(fname), crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
         self.flash_until = time.time() + 0.12
         self._update_count_label()
-        self.status_message.emit(f'saved {fname}', 1500)
+        n = len(boxes)
+        self.status_message.emit(f'saved {n} duck crop{"s" if n > 1 else ""}', 1500)

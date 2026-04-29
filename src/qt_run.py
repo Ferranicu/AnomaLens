@@ -22,8 +22,9 @@ from PyQt6.QtWidgets import (
 )
 
 from .anomaly_store import AnomalyStore
+from .duck_detector import detect_ducks, square_crop
 from .heatmap import render_heatmap, render_patch_grid
-from .imageio import bgr_to_tensor, center_square_view
+from .imageio import bgr_to_tensor
 from .patchcore import MemoryBank, PatchFeatureExtractor
 
 
@@ -95,51 +96,63 @@ class InferenceWorker(QObject):
                 if not ok:
                     continue
 
-                crop, (cx0, cy0, cs) = center_square_view(frame)
-                x = bgr_to_tensor(crop, self.device)
-                flat, (B, H, W) = self.extractor.embed(x)
-                scores = self.bank.score(flat).view(H, W)
-                max_score = float(scores.max().item())
-                score_map_np = scores.cpu().numpy()
-
-                if ema_score is None:
-                    ema_score = max_score
-                else:
-                    ema_score = self.ema * ema_score + (1.0 - self.ema) * max_score
-
-                display = frame.copy()
-                if self._show_heat:
-                    heat = render_heatmap(score_map_np, cs, vmax=self.threshold)
-                    local = display[cy0:cy0 + cs, cx0:cx0 + cs]
-                    blended = cv2.addWeighted(local, 1.0 - self.blend, heat, self.blend, 0.0)
-                    display[cy0:cy0 + cs, cx0:cx0 + cs] = blended
-                if self._show_grid:
-                    grid = render_patch_grid(score_map_np, cs, vmax=self.threshold)
-                    local = display[cy0:cy0 + cs, cx0:cx0 + cs]
-                    blended = cv2.addWeighted(local, 1.0 - self.blend, grid, self.blend, 0.0)
-                    display[cy0:cy0 + cs, cx0:cx0 + cs] = blended
-                cv2.rectangle(display, (cx0, cy0), (cx0 + cs, cy0 + cs), (255, 255, 255), 2)
-
                 now = time.time()
-                is_anom = ema_score > self.threshold
-                if (
-                    is_anom
-                    and not was_anom
-                    and (now - last_anom_t) > ANOMALY_COOLDOWN_S
-                ):
-                    zoom_bgr = self._extract_zoom(display, score_map_np, cx0, cy0, cs, H, W)
-                    self.anomaly_detected.emit(
-                        display.copy(), zoom_bgr,
-                        float(ema_score), float(self.threshold), now,
-                    )
-                    last_anom_t = now
-                was_anom = is_anom
+                display = frame.copy()
+                boxes = detect_ducks(frame)
+                raw_score = 0.0
 
+                if boxes:
+                    duck_results = []
+                    for box in boxes:
+                        crop, (cx0, cy0, cs) = square_crop(frame, box)
+                        x = bgr_to_tensor(crop, self.device)
+                        flat, (B, H, W) = self.extractor.embed(x)
+                        score_map = self.bank.score(flat).view(H, W).cpu().numpy()
+                        duck_results.append((box, (cx0, cy0, cs), score_map))
+
+                    raw_score = max(float(sm.max()) for _, _, sm in duck_results)
+                    if ema_score is None:
+                        ema_score = raw_score
+                    else:
+                        ema_score = self.ema * ema_score + (1.0 - self.ema) * raw_score
+
+                    for box, (cx0, cy0, cs), score_map in duck_results:
+                        if self._show_heat:
+                            heat = render_heatmap(score_map, cs, vmax=self.threshold)
+                            local = display[cy0:cy0 + cs, cx0:cx0 + cs]
+                            display[cy0:cy0 + cs, cx0:cx0 + cs] = cv2.addWeighted(
+                                local, 1.0 - self.blend, heat, self.blend, 0.0)
+                        if self._show_grid:
+                            grid = render_patch_grid(score_map, cs, vmax=self.threshold)
+                            local = display[cy0:cy0 + cs, cx0:cx0 + cs]
+                            display[cy0:cy0 + cs, cx0:cx0 + cs] = cv2.addWeighted(
+                                local, 1.0 - self.blend, grid, self.blend, 0.0)
+                        duck_max = float(score_map.max())
+                        col = (50, 50, 255) if duck_max > self.threshold else (60, 180, 80)
+                        cv2.rectangle(display, (cx0, cy0), (cx0 + cs, cy0 + cs), col, 3)
+                        cv2.putText(display, f'{duck_max:.2f}', (cx0 + 4, cy0 + cs - 8),
+                                    cv2.FONT_HERSHEY_DUPLEX, 0.55, col, 1, cv2.LINE_AA)
+
+                    is_anom = ema_score > self.threshold
+                    if is_anom and not was_anom and (now - last_anom_t) > ANOMALY_COOLDOWN_S:
+                        worst = max(duck_results, key=lambda t: t[2].max())
+                        _, (wx0, wy0, ws), _ = worst
+                        zoom_bgr = display[wy0:wy0 + ws, wx0:wx0 + ws].copy()
+                        self.anomaly_detected.emit(
+                            display.copy(), zoom_bgr,
+                            float(ema_score), float(self.threshold), now,
+                        )
+                        last_anom_t = now
+                    was_anom = is_anom
+                else:
+                    cv2.putText(display, 'no ducks detected', (20, 50),
+                                cv2.FONT_HERSHEY_DUPLEX, 0.9, (80, 80, 200), 2, cv2.LINE_AA)
+
+                ema_out = ema_score if ema_score is not None else 0.0
                 rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb.shape
                 qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
-
-                self.frame_ready.emit(qimg, max_score, float(ema_score))
+                self.frame_ready.emit(qimg, raw_score, ema_out)
 
                 fps_frames += 1
                 if now - fps_acc_t >= 0.5:
@@ -149,24 +162,6 @@ class InferenceWorker(QObject):
         finally:
             cap.release()
             self.finished.emit()
-
-    @staticmethod
-    def _extract_zoom(
-        display: np.ndarray,
-        score_map: np.ndarray,
-        cx0: int, cy0: int, cs: int,
-        gh: int, gw: int,
-    ) -> np.ndarray:
-        """Return a square crop of `display` centered on the score-map peak."""
-        gy, gx = np.unravel_index(int(np.argmax(score_map)), score_map.shape)
-        peak_x = int(cx0 + cs * (gx + 0.5) / gw)
-        peak_y = int(cy0 + cs * (gy + 0.5) / gh)
-        zs = max(72, cs // 3)
-        half = zs // 2
-        h, w = display.shape[:2]
-        x0 = max(0, min(w - zs, peak_x - half))
-        y0 = max(0, min(h - zs, peak_y - half))
-        return display[y0:y0 + zs, x0:x0 + zs].copy()
 
 
 class ScoreGraph(pg.PlotWidget):

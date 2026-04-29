@@ -17,7 +17,7 @@ from pathlib import Path
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.imageio import center_square_view  # noqa: E402
+from src.duck_detector import detect_ducks, square_crop  # noqa: E402
 
 
 def main() -> None:
@@ -40,8 +40,9 @@ def main() -> None:
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    show_crop = True
+    show_boxes = True
     flash_until = 0.0
+    latest_frame = None
 
     try:
         while True:
@@ -49,14 +50,22 @@ def main() -> None:
             if not ok:
                 continue
 
+            latest_frame = frame
+            boxes = detect_ducks(frame)
             display = frame.copy()
-            _, (x0, y0, s) = center_square_view(frame)
-            if show_crop:
-                cv2.rectangle(display, (x0, y0), (x0 + s, y0 + s), (0, 255, 0), 2)
 
-            hud = f'saved: {idx}/{args.count}   [SPACE] snap   [c] box   [q/ESC] quit'
+            if show_boxes:
+                for box in boxes:
+                    _, (x0, y0, s) = square_crop(frame, box)
+                    cv2.rectangle(display, (x0, y0), (x0 + s, y0 + s), (0, 255, 0), 2)
+            if not boxes:
+                cv2.putText(display, 'no ducks', (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 200), 2, cv2.LINE_AA)
+
+            hud = (f'saved: {idx}/{args.count}   ducks: {len(boxes)}'
+                   f'   [SPACE] snap   [c] boxes   [q/ESC] quit')
             cv2.rectangle(display, (0, 0), (display.shape[1], 34), (0, 0, 0), -1)
-            cv2.putText(display, hud, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(display, hud, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
             if time.time() < flash_until:
                 overlay = display.copy()
@@ -68,17 +77,23 @@ def main() -> None:
             if key in (27, ord('q')):
                 break
             if key == ord('c'):
-                show_crop = not show_crop
+                show_boxes = not show_boxes
             if key == ord(' '):
-                crop, _ = center_square_view(frame)
-                fname = out_dir / f'good_{idx:04d}.jpg'
-                cv2.imwrite(str(fname), crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                idx += 1
-                flash_until = time.time() + 0.12
-                print(f'saved {fname}')
-                if idx >= args.count:
-                    print('reached target count')
-                    break
+                if not boxes:
+                    print('no ducks detected — nothing saved')
+                else:
+                    saved = 0
+                    for box in boxes:
+                        crop, _ = square_crop(latest_frame, box)
+                        fname = out_dir / f'good_{idx:04d}.jpg'
+                        cv2.imwrite(str(fname), crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                        print(f'saved {fname}')
+                        idx += 1
+                        saved += 1
+                    flash_until = time.time() + 0.12
+                    if idx >= args.count:
+                        print('reached target count')
+                        break
     finally:
         cap.release()
         cv2.destroyAllWindows()

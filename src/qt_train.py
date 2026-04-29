@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .duck_detector import detect_ducks, square_crop
 from .heatmap import render_patch_grid
 from .imageio import bgr_to_tensor
 from .patchcore import INPUT_SIZE, MemoryBank, PatchFeatureExtractor, coreset_subsample
@@ -74,7 +75,9 @@ class TrainerWorker(QObject):
             if img is None:
                 self.log.emit(f'skip unreadable: {f}')
                 continue
-            tensors.append(bgr_to_tensor(img, self.device))
+            boxes = detect_ducks(img)
+            crop = square_crop(img, boxes[0])[0] if boxes else img
+            tensors.append(bgr_to_tensor(crop, self.device))
         if not tensors:
             return None
         return torch.cat(tensors, dim=0)

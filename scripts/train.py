@@ -12,6 +12,7 @@ import cv2
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.duck_detector import detect_ducks, square_crop  # noqa: E402
 from src.imageio import bgr_to_tensor  # noqa: E402
 from src.patchcore import MemoryBank, PatchFeatureExtractor, coreset_subsample, pick_device  # noqa: E402
 
@@ -46,7 +47,9 @@ def main() -> None:
             if img is None:
                 print(f'skip unreadable: {f}')
                 continue
-            tensors.append(bgr_to_tensor(img, device))
+            boxes = detect_ducks(img)
+            crop = square_crop(img, boxes[0])[0] if boxes else img
+            tensors.append(bgr_to_tensor(crop, device))
         if not tensors:
             continue
         x = torch.cat(tensors, dim=0)
@@ -73,7 +76,16 @@ def main() -> None:
     per_image_max: list[float] = []
     for i in range(0, len(files), args.batch):
         batch_files = files[i:i + args.batch]
-        tensors = [bgr_to_tensor(cv2.imread(str(f)), device) for f in batch_files]
+        tensors = []
+        for f in batch_files:
+            img = cv2.imread(str(f))
+            if img is None:
+                continue
+            boxes = detect_ducks(img)
+            crop = square_crop(img, boxes[0])[0] if boxes else img
+            tensors.append(bgr_to_tensor(crop, device))
+        if not tensors:
+            continue
         x = torch.cat(tensors, dim=0)
         flat, (B, H, W) = extractor.embed(x)
         scores = mem.score(flat).view(B, H, W)
