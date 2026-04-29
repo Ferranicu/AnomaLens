@@ -5,6 +5,7 @@ venv/
 dataset/
 models/
 snapshots/
+anomalies/
 .idea/
 .vscode/
 *.egg-info/

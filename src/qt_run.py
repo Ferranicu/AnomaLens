@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .anomaly_store import AnomalyStore
-from .heatmap import render_heatmap
+from .heatmap import render_heatmap, render_patch_grid
 from .imageio import bgr_to_tensor, center_square_view
 from .patchcore import MemoryBank, PatchFeatureExtractor
 
@@ -59,12 +59,16 @@ class InferenceWorker(QObject):
         self.threshold = float(threshold)
         self._stop = False
         self._show_heat = True
+        self._show_grid = False
 
     def stop(self) -> None:
         self._stop = True
 
     def set_show_heat(self, on: bool) -> None:
         self._show_heat = bool(on)
+
+    def set_show_grid(self, on: bool) -> None:
+        self._show_grid = bool(on)
 
     def set_threshold(self, t: float) -> None:
         self.threshold = float(t)
@@ -108,6 +112,11 @@ class InferenceWorker(QObject):
                     heat = render_heatmap(score_map_np, cs, vmax=self.threshold)
                     local = display[cy0:cy0 + cs, cx0:cx0 + cs]
                     blended = cv2.addWeighted(local, 1.0 - self.blend, heat, self.blend, 0.0)
+                    display[cy0:cy0 + cs, cx0:cx0 + cs] = blended
+                if self._show_grid:
+                    grid = render_patch_grid(score_map_np, cs, vmax=self.threshold)
+                    local = display[cy0:cy0 + cs, cx0:cx0 + cs]
+                    blended = cv2.addWeighted(local, 1.0 - self.blend, grid, self.blend, 0.0)
                     display[cy0:cy0 + cs, cx0:cx0 + cs] = blended
                 cv2.rectangle(display, (cx0, cy0), (cx0 + cs, cy0 + cs), (255, 255, 255), 2)
 
@@ -296,8 +305,17 @@ class RunScreen(QWidget):
         self.heat_btn.setChecked(True)
         self.heat_btn.toggled.connect(self.on_heat_toggle)
 
+        self.grid_btn = QPushButton('Patch grid: OFF')
+        self.grid_btn.setCheckable(True)
+        self.grid_btn.setChecked(False)
+        self.grid_btn.toggled.connect(self.on_grid_toggle)
+
         self.snap_btn = QPushButton('Save snapshot')
         self.snap_btn.clicked.connect(self.on_snap)
+
+        overlay_row = QHBoxLayout()
+        overlay_row.addWidget(self.heat_btn, stretch=1)
+        overlay_row.addWidget(self.grid_btn, stretch=1)
 
         side = QVBoxLayout()
         side.setContentsMargins(12, 12, 12, 12)
@@ -308,7 +326,7 @@ class RunScreen(QWidget):
         side.addWidget(self.threshold_label)
         side.addWidget(self.slider)
         side.addWidget(self.graph, stretch=1)
-        side.addWidget(self.heat_btn)
+        side.addLayout(overlay_row)
         side.addWidget(self.snap_btn)
 
         side_widget = QWidget()
@@ -368,6 +386,7 @@ class RunScreen(QWidget):
             self.threshold,
         )
         self.worker.set_show_heat(self.heat_btn.isChecked())
+        self.worker.set_show_grid(self.grid_btn.isChecked())
         self.thread = QThread(self)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -440,6 +459,11 @@ class RunScreen(QWidget):
         if self.worker is not None:
             self.worker.set_show_heat(checked)
         self.heat_btn.setText(f'Heatmap: {"ON" if checked else "OFF"}')
+
+    def on_grid_toggle(self, checked: bool) -> None:
+        if self.worker is not None:
+            self.worker.set_show_grid(checked)
+        self.grid_btn.setText(f'Patch grid: {"ON" if checked else "OFF"}')
 
     def on_snap(self) -> None:
         if self.last_qimg is None:

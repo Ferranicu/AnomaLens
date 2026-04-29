@@ -6,9 +6,10 @@ import traceback
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
-from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QHBoxLayout,
@@ -22,14 +23,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .heatmap import render_patch_grid
 from .imageio import bgr_to_tensor
-from .patchcore import MemoryBank, PatchFeatureExtractor, coreset_subsample
+from .patchcore import INPUT_SIZE, MemoryBank, PatchFeatureExtractor, coreset_subsample
 
 
 class TrainerWorker(QObject):
     progress = pyqtSignal(int, str)
     log = pyqtSignal(str)
     done = pyqtSignal(bool, str, str)  # success, message, bank_path
+    viz_frame = pyqtSignal(object, float, float)  # bgr_ndarray, score_min, score_max
 
     def __init__(
         self,
@@ -51,6 +54,18 @@ class TrainerWorker(QObject):
 
     def stop(self) -> None:
         self._stop = True
+
+    def _emit_viz(self, img_file: Path, score_map: np.ndarray) -> None:
+        img = cv2.imread(str(img_file))
+        if img is None:
+            return
+        h, w = img.shape[:2]
+        s = min(h, w)
+        crop = img[(h - s) // 2:(h - s) // 2 + s, (w - s) // 2:(w - s) // 2 + s]
+        crop = cv2.resize(crop, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_AREA)
+        grid = render_patch_grid(score_map, INPUT_SIZE, vmax=None)
+        blended = cv2.addWeighted(crop, 0.45, grid, 0.55, 0.0)
+        self.viz_frame.emit(blended, float(score_map.min()), float(score_map.max()))
 
     def _load_batch(self, files: list[Path]) -> torch.Tensor | None:
         tensors = []
@@ -118,6 +133,7 @@ class TrainerWorker(QObject):
                 per_image_max.extend(scores.amax(dim=(1, 2)).cpu().tolist())
                 done = i + len(batch_files)
                 self.progress.emit(60 + int(done / n * 35), f'calibrate {done}/{n}')
+                self._emit_viz(batch_files[-1], scores[-1].cpu().numpy())
 
             good_mean = statistics.fmean(per_image_max)
             good_max = max(per_image_max)
@@ -217,6 +233,38 @@ class TrainScreen(QWidget):
         self.log_view.setFont(mono)
         self.log_view.setPlaceholderText('Training log will appear here.')
 
+        # Viz panel — shows patch grid on calibration images (toggleable)
+        VIZ_SIZE = 256
+        self.viz_btn = QPushButton('Calibration viz: ON')
+        self.viz_btn.setCheckable(True)
+        self.viz_btn.setChecked(True)
+        self.viz_btn.toggled.connect(self._on_viz_toggle)
+
+        self.viz_label = QLabel()
+        self.viz_label.setFixedSize(VIZ_SIZE, VIZ_SIZE)
+        self.viz_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.viz_label.setStyleSheet(
+            'background: #0e0e14; border: 1px solid #2a2a3a; color: #555;'
+        )
+        self.viz_label.setText('patch grid\nappears during\ncalibration')
+
+        self.viz_score_label = QLabel()
+        self.viz_score_label.setFont(mono)
+        self.viz_score_label.setStyleSheet('color: #7070a8; font-size: 9pt;')
+        self.viz_score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        viz_col = QVBoxLayout()
+        viz_col.setSpacing(6)
+        viz_col.addWidget(self.viz_btn)
+        viz_col.addWidget(self.viz_label)
+        viz_col.addWidget(self.viz_score_label)
+        viz_col.addStretch(1)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(12)
+        bottom_row.addWidget(self.log_view, stretch=1)
+        bottom_row.addLayout(viz_col)
+
         root = QVBoxLayout()
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(10)
@@ -225,7 +273,7 @@ class TrainScreen(QWidget):
         root.addLayout(params_row)
         root.addLayout(btn_row)
         root.addWidget(self.progress)
-        root.addWidget(self.log_view, stretch=1)
+        root.addLayout(bottom_row, stretch=1)
         self.setLayout(root)
 
     def on_train_clicked(self) -> None:
@@ -254,6 +302,7 @@ class TrainScreen(QWidget):
         self.worker.log.connect(self.on_log)
         self.worker.done.connect(self.on_done)
         self.worker.done.connect(self.thread.quit)
+        self.worker.viz_frame.connect(self.on_viz_frame)
         self.thread.start()
 
         self.train_btn.setEnabled(False)
@@ -276,6 +325,29 @@ class TrainScreen(QWidget):
     @pyqtSlot(str)
     def on_log(self, line: str) -> None:
         self.log_view.appendPlainText(line)
+
+    @pyqtSlot(object, float, float)
+    def on_viz_frame(self, bgr: np.ndarray, score_min: float, score_max: float) -> None:
+        if not self.viz_btn.isChecked():
+            return
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.viz_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.viz_label.setPixmap(pix)
+        self.viz_label.setText('')
+        self.viz_score_label.setText(f'score  min {score_min:.3f}  max {score_max:.3f}')
+
+    def _on_viz_toggle(self, checked: bool) -> None:
+        self.viz_btn.setText(f'Calibration viz: {"ON" if checked else "OFF"}')
+        if not checked:
+            self.viz_label.clear()
+            self.viz_label.setText('patch grid\nappears during\ncalibration')
+            self.viz_score_label.setText('')
 
     @pyqtSlot(bool, str, str)
     def on_done(self, success: bool, msg: str, bank_path: str) -> None:

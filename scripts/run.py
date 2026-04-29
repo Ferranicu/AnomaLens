@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.heatmap import render_heatmap  # noqa: E402
+from src.heatmap import render_heatmap, render_patch_grid  # noqa: E402
 from src.imageio import bgr_to_tensor, center_square_view  # noqa: E402
 from src.patchcore import INPUT_SIZE, MemoryBank, PatchFeatureExtractor, pick_device  # noqa: E402
 
@@ -35,7 +35,7 @@ COL_BG    = (255, 255, 255)
 
 
 def draw_panel(frame: np.ndarray, is_anom: bool, score: float, threshold: float,
-               fps: float, show_heat: bool) -> None:
+               fps: float, show_heat: bool, show_grid: bool) -> None:
     """Draw the OK/ANOMALY badge + readouts on the frame."""
     H, W = frame.shape[:2]
 
@@ -43,7 +43,8 @@ def draw_panel(frame: np.ndarray, is_anom: bool, score: float, threshold: float,
     bar_h = 36
     cv2.rectangle(frame, (0, 0), (W, bar_h), COL_BG, -1)
     cv2.rectangle(frame, (0, bar_h - 1), (W, bar_h), COL_RULE, -1)
-    text = f'score: {score:6.3f}   thr: {threshold:.3f}   fps: {fps:4.1f}   heat: {"on" if show_heat else "off"}'
+    overlays = f'heat:{"on" if show_heat else "off"}  grid:{"on" if show_grid else "off"}'
+    text = f'score: {score:6.3f}   thr: {threshold:.3f}   fps: {fps:4.1f}   {overlays}'
     cv2.putText(frame, text, (12, 24), cv2.FONT_HERSHEY_DUPLEX, 0.55, COL_INK, 1, cv2.LINE_AA)
 
     # Big badge on the right side
@@ -60,7 +61,7 @@ def draw_panel(frame: np.ndarray, is_anom: bool, score: float, threshold: float,
     cv2.putText(frame, sub, (bx0 + 18, by0 + 74), cv2.FONT_HERSHEY_DUPLEX, 0.52, COL_INK, 1, cv2.LINE_AA)
 
     # Footer hint
-    hint = '[ / ] threshold    h: heatmap    s: snapshot    q: quit'
+    hint = '[ / ] threshold    h: heatmap    g: patch grid    s: snapshot    q: quit'
     cv2.rectangle(frame, (0, H - 28), (W, H), COL_BG, -1)
     cv2.rectangle(frame, (0, H - 28), (W, H - 27), COL_RULE, -1)
     cv2.putText(frame, hint, (12, H - 9), cv2.FONT_HERSHEY_DUPLEX, 0.5, COL_INK, 1, cv2.LINE_AA)
@@ -94,6 +95,7 @@ def main() -> None:
     snap_dir.mkdir(parents=True, exist_ok=True)
 
     show_heat = True
+    show_grid = False
     ema_score = None
     ema = float(args.ema)
     fps = 0.0
@@ -124,9 +126,13 @@ def main() -> None:
             display = frame.copy()
             if show_heat:
                 heat = render_heatmap(score_map_np, cs, vmax=threshold)
-                # Modulate heat alpha by score magnitude so "OK" frames stay calm
                 local = display[cy0:cy0 + cs, cx0:cx0 + cs]
                 blended = cv2.addWeighted(local, 1.0 - args.blend, heat, args.blend, 0.0)
+                display[cy0:cy0 + cs, cx0:cx0 + cs] = blended
+            if show_grid:
+                grid = render_patch_grid(score_map_np, cs, vmax=threshold)
+                local = display[cy0:cy0 + cs, cx0:cx0 + cs]
+                blended = cv2.addWeighted(local, 1.0 - args.blend, grid, args.blend, 0.0)
                 display[cy0:cy0 + cs, cx0:cx0 + cs] = blended
 
             # Crop bounding box
@@ -139,7 +145,7 @@ def main() -> None:
             inst_fps = 1.0 / max(dt, 1e-3)
             fps = 0.9 * fps + 0.1 * inst_fps if fps else inst_fps
 
-            draw_panel(display, is_anom, ema_score, threshold, fps, show_heat)
+            draw_panel(display, is_anom, ema_score, threshold, fps, show_heat, show_grid)
 
             cv2.imshow('PatoInspector — live', display)
             key = cv2.waitKey(1) & 0xFF
@@ -153,6 +159,9 @@ def main() -> None:
                 print(f'threshold -> {threshold:.3f}')
             if key == ord('h'):
                 show_heat = not show_heat
+            if key == ord('g'):
+                show_grid = not show_grid
+                print(f'patch grid -> {"on" if show_grid else "off"}')
             if key == ord('s'):
                 fname = snap_dir / f'snap_{int(now)}.jpg'
                 cv2.imwrite(str(fname), display, [cv2.IMWRITE_JPEG_QUALITY, 92])
