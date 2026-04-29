@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.heatmap import render_heatmap  # noqa: E402
 from src.imageio import bgr_to_tensor, center_square_view  # noqa: E402
 from src.patchcore import INPUT_SIZE, MemoryBank, PatchFeatureExtractor, pick_device  # noqa: E402
 
@@ -31,20 +32,6 @@ COL_BAD   = (50, 50, 255)      # red
 COL_INK   = (20, 20, 20)
 COL_RULE  = (232, 232, 232)
 COL_BG    = (255, 255, 255)
-
-
-def render_heatmap(score_map: np.ndarray, size: int) -> np.ndarray:
-    """score_map: (H, W) float -> (size, size, 3) BGR colormap (JET)."""
-    # Normalize per-frame to [0, 255]
-    lo = float(score_map.min())
-    hi = float(score_map.max())
-    if hi - lo < 1e-6:
-        norm = np.zeros_like(score_map, dtype=np.uint8)
-    else:
-        norm = ((score_map - lo) / (hi - lo) * 255.0).astype(np.uint8)
-    cm = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-    cm = cv2.resize(cm, (size, size), interpolation=cv2.INTER_LINEAR)
-    return cm
 
 
 def draw_panel(frame: np.ndarray, is_anom: bool, score: float, threshold: float,
@@ -136,7 +123,7 @@ def main() -> None:
             # Overlay heatmap on the crop region
             display = frame.copy()
             if show_heat:
-                heat = render_heatmap(score_map_np, cs)
+                heat = render_heatmap(score_map_np, cs, vmax=threshold)
                 # Modulate heat alpha by score magnitude so "OK" frames stay calm
                 local = display[cy0:cy0 + cs, cx0:cx0 + cs]
                 blended = cv2.addWeighted(local, 1.0 - args.blend, heat, args.blend, 0.0)
