@@ -1,20 +1,27 @@
-"""Run screen — live PatchCore inference with heatmap overlay + score graph."""
+"""Run screen — live PatchCore inference, fair-mode UI.
+
+Right panel: anomaly-only live zoom cards, hidden when the frame is clean.
+Controls: edge-reveal bottom drawer with slide/fade animation.
+"""
 from __future__ import annotations
 
-import collections
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QFont, QImage, QPixmap
+from PyQt6.QtCore import (
+    QEasingCurve, QEvent, QRect, Qt, QObject, QParallelAnimationGroup, QPropertyAnimation,
+    QThread, pyqtSignal, pyqtSlot,
+)
+from PyQt6.QtGui import QCursor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -28,28 +35,24 @@ from .imageio import bgr_to_tensor
 from .patchcore import MemoryBank, PatchFeatureExtractor
 
 
-HISTORY = 300
 ANOMALY_COOLDOWN_S = 1.5
+DUCK_CARD_ZOOM = 224     # px — square zoom image per duck card
+PANEL_WIDTH = 264        # right panel width
+CONTROLS_EDGE_PX = 16
+CONTROLS_AWAY_PX = 72
+MAX_DUCK_SLOTS = 4
+_WORKER_ZOOM = 256       # intermediate resolution from worker
 
 
 class InferenceWorker(QObject):
-    frame_ready = pyqtSignal(QImage, float, float)
+    # main_qimg, anomaly_data list[(QImage, score)], raw, ema, has_duck
+    frame_ready = pyqtSignal(QImage, object, float, float, bool)
     fps_update = pyqtSignal(float)
     error = pyqtSignal(str)
     finished = pyqtSignal()
     anomaly_detected = pyqtSignal(object, object, float, float, float)
-    # full_bgr, zoom_bgr, score, threshold, ts
 
-    def __init__(
-        self,
-        extractor: PatchFeatureExtractor,
-        bank: MemoryBank,
-        device,
-        camera_index: int,
-        ema: float,
-        blend: float,
-        threshold: float,
-    ):
+    def __init__(self, extractor, bank, device, camera_index, ema, blend, threshold):
         super().__init__()
         self.extractor = extractor
         self.bank = bank
@@ -59,20 +62,52 @@ class InferenceWorker(QObject):
         self.blend = float(blend)
         self.threshold = float(threshold)
         self._stop = False
-        self._show_heat = True
+        self._show_heat = False
         self._show_grid = False
 
-    def stop(self) -> None:
-        self._stop = True
+    def stop(self) -> None: self._stop = True
+    def set_show_heat(self, on: bool) -> None: self._show_heat = bool(on)
+    def set_show_grid(self, on: bool) -> None: self._show_grid = bool(on)
+    def set_threshold(self, t: float) -> None: self.threshold = float(t)
 
-    def set_show_heat(self, on: bool) -> None:
-        self._show_heat = bool(on)
+    def _bgr_qimg(self, bgr: np.ndarray) -> QImage:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        return QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
 
-    def set_show_grid(self, on: bool) -> None:
-        self._show_grid = bool(on)
+    def _peak_zoom(self, bgr: np.ndarray, crop_box: tuple[int, int, int], score_map: np.ndarray) -> np.ndarray:
+        x0, y0, x1, y1 = self._peak_square(crop_box, score_map, scale=5)
+        marked = bgr.copy()
+        cv2.rectangle(marked, (x0, y0), (x1, y1), (35, 35, 255), 3)
 
-    def set_threshold(self, t: float) -> None:
-        self.threshold = float(t)
+        cx = (x0 + x1) // 2
+        cy = (y0 + y1) // 2
+        _cx0, _cy0, cs = crop_box
+        H, W = marked.shape[:2]
+        size = max(48, int(cs * 0.42))
+        size = min(size, H, W)
+        half = size // 2
+        zx0 = max(0, min(W - size, cx - half))
+        zy0 = max(0, min(H - size, cy - half))
+        return marked[zy0:zy0 + size, zx0:zx0 + size].copy()
+
+    def _peak_square(
+        self,
+        crop_box: tuple[int, int, int],
+        score_map: np.ndarray,
+        scale: int = 3,
+    ) -> tuple[int, int, int, int]:
+        cx0, cy0, cs = crop_box
+        map_h, map_w = score_map.shape
+        py, px = np.unravel_index(int(np.argmax(score_map)), score_map.shape)
+        cell = max(8, int(round(cs / max(map_h, map_w, 1))))
+        size = min(cs, max(cell * scale, 24))
+        cx = cx0 + int((px + 0.5) * cs / max(map_w, 1))
+        cy = cy0 + int((py + 0.5) * cs / max(map_h, 1))
+        half = size // 2
+        x0 = max(cx0, min(cx0 + cs - size, cx - half))
+        y0 = max(cy0, min(cy0 + cs - size, cy - half))
+        return x0, y0, x0 + size, y0 + size
 
     @pyqtSlot()
     def run(self) -> None:
@@ -100,6 +135,8 @@ class InferenceWorker(QObject):
                 display = frame.copy()
                 boxes = detect_ducks(frame)
                 raw_score = 0.0
+                anomaly_data: list[tuple[QImage, float, int]] = []
+                is_anom = False
 
                 if boxes:
                     duck_results = []
@@ -115,8 +152,9 @@ class InferenceWorker(QObject):
                         ema_score = raw_score
                     else:
                         ema_score = self.ema * ema_score + (1.0 - self.ema) * raw_score
+                    is_anom = ema_score > self.threshold
 
-                    for box, (cx0, cy0, cs), score_map in duck_results:
+                    for _, (cx0, cy0, cs), score_map in duck_results:
                         if self._show_heat:
                             heat = render_heatmap(score_map, cs, vmax=self.threshold)
                             local = display[cy0:cy0 + cs, cx0:cx0 + cs]
@@ -132,12 +170,16 @@ class InferenceWorker(QObject):
                         cv2.rectangle(display, (cx0, cy0), (cx0 + cs, cy0 + cs), col, 3)
                         cv2.putText(display, f'{duck_max:.2f}', (cx0 + 4, cy0 + cs - 8),
                                     cv2.FONT_HERSHEY_DUPLEX, 0.55, col, 1, cv2.LINE_AA)
+                        if duck_max > self.threshold:
+                            peak_crop = self._peak_zoom(frame, (cx0, cy0, cs), score_map)
+                            zoomed = cv2.resize(peak_crop, (_WORKER_ZOOM, _WORKER_ZOOM),
+                                                interpolation=cv2.INTER_LINEAR)
+                            anomaly_data.append((self._bgr_qimg(zoomed), duck_max, cx0 + cs // 2))
 
-                    is_anom = ema_score > self.threshold
                     if is_anom and not was_anom and (now - last_anom_t) > ANOMALY_COOLDOWN_S:
                         worst = max(duck_results, key=lambda t: t[2].max())
-                        _, (wx0, wy0, ws), _ = worst
-                        zoom_bgr = display[wy0:wy0 + ws, wx0:wx0 + ws].copy()
+                        _, worst_crop_box, worst_score_map = worst
+                        zoom_bgr = self._peak_zoom(frame, worst_crop_box, worst_score_map)
                         self.anomaly_detected.emit(
                             display.copy(), zoom_bgr,
                             float(ema_score), float(self.threshold), now,
@@ -147,12 +189,17 @@ class InferenceWorker(QObject):
                 else:
                     cv2.putText(display, 'no ducks detected', (20, 50),
                                 cv2.FONT_HERSHEY_DUPLEX, 0.9, (80, 80, 200), 2, cv2.LINE_AA)
+                    was_anom = False
 
                 ema_out = ema_score if ema_score is not None else 0.0
-                rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb.shape
-                qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
-                self.frame_ready.emit(qimg, raw_score, ema_out)
+                anomaly_data.sort(key=lambda item: item[2])
+                self.frame_ready.emit(
+                    self._bgr_qimg(display),
+                    [(qimg, score) for qimg, score, _center_x in anomaly_data],
+                    raw_score,
+                    ema_out,
+                    bool(boxes),
+                )
 
                 fps_frames += 1
                 if now - fps_acc_t >= 0.5:
@@ -164,52 +211,62 @@ class InferenceWorker(QObject):
             self.finished.emit()
 
 
-class ScoreGraph(pg.PlotWidget):
-    def __init__(self, threshold: float):
-        super().__init__()
-        self.setBackground('#1a1a24')
-        self.setMouseEnabled(False, False)
-        self.hideButtons()
-        self.setMenuEnabled(False)
-        self.showGrid(x=False, y=True, alpha=0.08)
-        self.getAxis('left').setTextPen(pg.mkPen('#686888'))
-        self.getAxis('bottom').setTextPen(pg.mkPen('#686888'))
-        self.getAxis('left').setPen(pg.mkPen('#2e2e42'))
-        self.getAxis('bottom').setPen(pg.mkPen('#2e2e42'))
-        self.setLabel('left', 'score', color='#686888')
-        self.setLabel('bottom', 'frame', color='#686888')
+class DuckCard(QWidget):
+    """Single image-only anomaly card for the right panel."""
 
-        self.raw_data: collections.deque[float] = collections.deque(maxlen=HISTORY)
-        self.ema_data: collections.deque[float] = collections.deque(maxlen=HISTORY)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('DuckCard')
+        self._bad = False
+        self._build()
 
-        self.raw_curve = self.plot(pen=pg.mkPen(color=(60, 80, 160), width=1))
-        self.ema_curve = self.plot(pen=pg.mkPen(color=(100, 160, 255), width=2))
-        self.thr_line = pg.InfiniteLine(
-            angle=0,
-            pos=threshold,
-            pen=pg.mkPen(color=(220, 50, 50), width=2, style=Qt.PenStyle.DashLine),
+    def _build(self) -> None:
+        self._zoom = QLabel()
+        self._zoom.setFixedSize(DUCK_CARD_ZOOM, DUCK_CARD_ZOOM)
+        self._zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        lay = QVBoxLayout()
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(0)
+        lay.addWidget(self._zoom, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.setLayout(lay)
+        self._apply_style(ok=True)
+
+    def update_duck(self, idx: int, qimg: QImage, score: float, is_bad: bool = True) -> None:
+        pix = QPixmap.fromImage(qimg).scaled(
+            self._zoom.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
-        self.addItem(self.thr_line)
+        self._zoom.setPixmap(pix)
+        self._zoom.setText('')
+        if not self._bad:
+            self._bad = True
+            self._apply_style(ok=False)
+        self.show()
 
-        self.setYRange(0, max(threshold * 3.0, 2.0))
-        self.enableAutoRange(axis='y')
-        self.setLimits(yMin=0)
+    def clear(self) -> None:
+        self.hide()
 
-    def append(self, raw: float, ema: float) -> None:
-        self.raw_data.append(raw)
-        self.ema_data.append(ema)
-        xs = np.arange(len(self.raw_data))
-        self.raw_curve.setData(xs, np.fromiter(self.raw_data, dtype=float))
-        self.ema_curve.setData(xs, np.fromiter(self.ema_data, dtype=float))
-
-    def reset(self) -> None:
-        self.raw_data.clear()
-        self.ema_data.clear()
-        self.raw_curve.setData([], [])
-        self.ema_curve.setData([], [])
-
-    def set_threshold(self, t: float) -> None:
-        self.thr_line.setValue(t)
+    def _apply_style(self, ok: bool) -> None:
+        if ok:
+            self.setStyleSheet(
+                'QWidget#DuckCard {'
+                '  background:#111217; border:1px solid #242836; border-radius:6px;'
+                '}'
+            )
+            self._zoom.setStyleSheet(
+                'background:#08090d; border:1px solid #202434; border-radius:4px;'
+            )
+        else:
+            self.setStyleSheet(
+                'QWidget#DuckCard {'
+                '  background:#171114; border:1px solid #6b2a30; border-radius:6px;'
+                '}'
+            )
+            self._zoom.setStyleSheet(
+                'background:#09070a; border:1px solid #3f171c; border-radius:4px;'
+            )
 
 
 class RunScreen(QWidget):
@@ -232,31 +289,100 @@ class RunScreen(QWidget):
         self.store = store
         self.ema = ema
         self.blend = blend
-
         self.bank: MemoryBank | None = None
         self.threshold = 1.0
         self.last_qimg: QImage | None = None
         self.worker: InferenceWorker | None = None
         self.thread: QThread | None = None
 
+        self._info_panel_visible = False
+        self._controls_visible = False
+
         self._build_ui(default_bank, default_camera)
+        self._setup_animation()
+        self.setMouseTracking(True)
 
         if Path(default_bank).exists():
             self._load_bank(default_bank)
 
+    # ── Build UI ─────────────────────────────────────────────────────────
+
     def _build_ui(self, default_bank: str, default_camera: int) -> None:
-        self.video_label = QLabel('No bank loaded.\nTrain a bank or pick an existing one.')
+        self.video_label = QLabel('No bank loaded.\nTrain or load a bank, then press Start.')
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setMinimumSize(640, 480)
-        self.video_label.setStyleSheet('background:#101010; color:#888; font-size:14px;')
+        self.video_label.setStyleSheet('background:#06060c; color:#44445a; font-size:14px;')
+        self.video_label.setMouseTracking(True)
+        self.video_label.installEventFilter(self)
 
-        mono = QFont('Consolas')
+        self.info_panel = self._build_info_panel()
+
+        root = QHBoxLayout()
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.video_label, stretch=1)
+        root.addWidget(self.info_panel)
+        self.setLayout(root)
+
+        self.controls_overlay = self._build_controls_overlay(default_bank, default_camera)
+        self.controls_overlay.hide()
+
+    def _build_info_panel(self) -> QWidget:
+        self._duck_cards: list[DuckCard] = []
+        cards_widget = QWidget()
+        cards_widget.setStyleSheet('background:transparent;')
+        cards_lay = QVBoxLayout(cards_widget)
+        cards_lay.setContentsMargins(10, 10, 10, 10)
+        cards_lay.setSpacing(10)
+        for _ in range(MAX_DUCK_SLOTS):
+            card = DuckCard()
+            card.hide()
+            cards_lay.addWidget(card)
+            self._duck_cards.append(card)
+        cards_lay.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidget(cards_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            'QScrollArea { border:none; background:transparent; }'
+            'QScrollBar:vertical { background:#0c0d13; width:5px; border-radius:2px; }'
+            'QScrollBar::handle:vertical { background:#3a242a; border-radius:2px; }'
+            'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }'
+        )
+
+        panel_lay = QVBoxLayout()
+        panel_lay.setContentsMargins(0, 0, 0, 0)
+        panel_lay.setSpacing(0)
+        panel_lay.addWidget(scroll, stretch=1)
+
+        panel = QWidget()
+        panel.setLayout(panel_lay)
+        panel.setMinimumWidth(0)
+        panel.setMaximumWidth(0)
+        panel.setStyleSheet(
+            'background:#0c0d13; border-left:1px solid #352027;'
+        )
+        panel.hide()
+        return panel
+
+    def _build_controls_overlay(self, default_bank: str, default_camera: int) -> QWidget:
+        overlay = QWidget(self)
+        overlay.setObjectName('ControlsOverlay')
+        overlay.setStyleSheet(
+            'QWidget#ControlsOverlay { background:#10111a; border-top:1px solid #303448; }'
+            'QLabel { color:#8c90ad; background:transparent; }'
+        )
+        overlay.setMouseTracking(True)
+        overlay.installEventFilter(self)
+
+        mono = QFont('Consolas', 10)
         mono.setStyleHint(QFont.StyleHint.Monospace)
-        mono.setPointSize(11)
 
         bank_row = QHBoxLayout()
         self.bank_edit = QLineEdit(default_bank)
-        self.load_btn = QPushButton('Load')
+        self.load_btn = QPushButton('Load bank')
         self.load_btn.clicked.connect(self.on_load_clicked)
         bank_row.addWidget(QLabel('Bank:'))
         bank_row.addWidget(self.bank_edit, stretch=1)
@@ -266,9 +392,9 @@ class RunScreen(QWidget):
         self.cam_spin = QSpinBox()
         self.cam_spin.setRange(0, 9)
         self.cam_spin.setValue(default_camera)
-        self.start_btn = QPushButton('Start')
+        self.start_btn = QPushButton('▶  Start')
         self.start_btn.clicked.connect(self.on_start_clicked)
-        self.stop_btn = QPushButton('Stop')
+        self.stop_btn = QPushButton('■  Stop')
         self.stop_btn.clicked.connect(self.stop_inference)
         self.stop_btn.setEnabled(False)
         cam_row.addWidget(QLabel('Camera:'))
@@ -277,64 +403,145 @@ class RunScreen(QWidget):
         cam_row.addWidget(self.start_btn)
         cam_row.addWidget(self.stop_btn)
 
-        self.score_label = QLabel('raw:  --\nema:  --')
-        self.score_label.setFont(mono)
-        self.score_label.setStyleSheet('color: #9090c0; background: #1e1e2a; padding: 6px 8px; border-radius: 4px;')
-
+        thr_row = QHBoxLayout()
         self.threshold_label = QLabel(f'threshold: {self.threshold:.3f}')
         self.threshold_label.setFont(mono)
-        self.threshold_label.setStyleSheet('color: #7070a8;')
-
+        self.threshold_label.setFixedWidth(190)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 5000)
         self.slider.setValue(int(self.threshold * 1000))
         self.slider.setSingleStep(10)
         self.slider.setPageStep(50)
         self.slider.valueChanged.connect(self.on_slider)
+        thr_row.addWidget(self.threshold_label)
+        thr_row.addWidget(self.slider, stretch=1)
 
-        self.graph = ScoreGraph(self.threshold)
-        self.graph.setMinimumHeight(220)
-
-        self.heat_btn = QPushButton('Heatmap: ON')
+        btn_row = QHBoxLayout()
+        self.heat_btn = QPushButton('Heatmap: OFF')
         self.heat_btn.setCheckable(True)
-        self.heat_btn.setChecked(True)
+        self.heat_btn.setChecked(False)
         self.heat_btn.toggled.connect(self.on_heat_toggle)
-
         self.grid_btn = QPushButton('Patch grid: OFF')
         self.grid_btn.setCheckable(True)
         self.grid_btn.setChecked(False)
         self.grid_btn.toggled.connect(self.on_grid_toggle)
-
-        self.snap_btn = QPushButton('Save snapshot')
+        self.snap_btn = QPushButton('Snapshot')
         self.snap_btn.clicked.connect(self.on_snap)
+        btn_row.addWidget(self.heat_btn, stretch=1)
+        btn_row.addWidget(self.grid_btn, stretch=1)
+        btn_row.addWidget(self.snap_btn)
 
-        overlay_row = QHBoxLayout()
-        overlay_row.addWidget(self.heat_btn, stretch=1)
-        overlay_row.addWidget(self.grid_btn, stretch=1)
+        lay = QVBoxLayout()
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+        lay.addLayout(bank_row)
+        lay.addLayout(cam_row)
+        lay.addLayout(thr_row)
+        lay.addLayout(btn_row)
+        overlay.setLayout(lay)
+        return overlay
 
-        side = QVBoxLayout()
-        side.setContentsMargins(12, 12, 12, 12)
-        side.setSpacing(10)
-        side.addLayout(bank_row)
-        side.addLayout(cam_row)
-        side.addWidget(self.score_label)
-        side.addWidget(self.threshold_label)
-        side.addWidget(self.slider)
-        side.addWidget(self.graph, stretch=1)
-        side.addLayout(overlay_row)
-        side.addWidget(self.snap_btn)
+    def _setup_animation(self) -> None:
+        self._fx = QGraphicsOpacityEffect(self.controls_overlay)
+        self._fx.setOpacity(0.0)
+        self.controls_overlay.setGraphicsEffect(self._fx)
 
-        side_widget = QWidget()
-        side_widget.setLayout(side)
-        side_widget.setFixedWidth(360)
-        side_widget.setStyleSheet('background: #16161e; border-left: 1px solid #22222e;')
+        self._controls_anim = QParallelAnimationGroup(self)
+        self._controls_opacity_anim = QPropertyAnimation(self._fx, b'opacity', self)
+        self._controls_geometry_anim = QPropertyAnimation(self.controls_overlay, b'geometry', self)
+        for anim in (self._controls_opacity_anim, self._controls_geometry_anim):
+            anim.setDuration(220)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._controls_anim.addAnimation(anim)
+        self._controls_anim.finished.connect(self._on_controls_anim_done)
 
-        root = QHBoxLayout()
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(self.video_label, stretch=1)
-        root.addWidget(side_widget)
-        self.setLayout(root)
+        self._panel_anim = QParallelAnimationGroup(self)
+        self._panel_fx = QGraphicsOpacityEffect(self.info_panel)
+        self._panel_fx.setOpacity(0.0)
+        self.info_panel.setGraphicsEffect(self._panel_fx)
+        self._panel_opacity_anim = QPropertyAnimation(self._panel_fx, b'opacity', self)
+        self._panel_min_anim = QPropertyAnimation(self.info_panel, b'minimumWidth', self)
+        self._panel_max_anim = QPropertyAnimation(self.info_panel, b'maximumWidth', self)
+        for anim in (self._panel_opacity_anim, self._panel_min_anim, self._panel_max_anim):
+            anim.setDuration(300)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._panel_anim.addAnimation(anim)
+        self._panel_anim.finished.connect(self._on_panel_anim_done)
+
+    # ── Overlay show / hide ──────────────────────────────────────────────
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reposition_overlay()
+
+    def _reposition_overlay(self) -> None:
+        self.controls_overlay.setGeometry(self._controls_rect(self._controls_visible))
+        self.controls_overlay.raise_()
+
+    def _controls_rect(self, visible: bool) -> QRect:
+        oh = self.controls_overlay.sizeHint().height()
+        video_w = max(0, self.width() - self.info_panel.width())
+        y = self.height() - oh if visible else self.height()
+        return QRect(0, y, video_w, oh)
+
+    def _set_info_panel_visible(self, visible: bool) -> None:
+        if visible == self._info_panel_visible:
+            return
+        self._info_panel_visible = visible
+        self._panel_anim.stop()
+        start = max(self.info_panel.width(), 0)
+        target = PANEL_WIDTH if visible else 0
+        if visible:
+            self.info_panel.show()
+        for anim in (self._panel_min_anim, self._panel_max_anim):
+            anim.setStartValue(start)
+            anim.setEndValue(target)
+        self._panel_opacity_anim.setStartValue(float(self._panel_fx.opacity()))
+        self._panel_opacity_anim.setEndValue(1.0 if visible else 0.0)
+        for anim in (self._panel_opacity_anim, self._panel_min_anim, self._panel_max_anim):
+            anim.setDuration(300 if visible else 210)
+        self._panel_anim.start()
+
+    def _on_panel_anim_done(self) -> None:
+        if not self._info_panel_visible:
+            self.info_panel.hide()
+        self._reposition_overlay()
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseMove:
+            if obj is self.video_label or obj is self.controls_overlay:
+                self._update_controls_from_mouse()
+        return super().eventFilter(obj, event)
+
+    def _update_controls_from_mouse(self) -> None:
+        pos = self.mapFromGlobal(QCursor.pos())
+        oh = self.controls_overlay.sizeHint().height()
+        if pos.y() >= self.height() - CONTROLS_EDGE_PX:
+            self._set_controls_visible(True)
+        elif self._controls_visible and pos.y() < self.height() - oh - CONTROLS_AWAY_PX:
+            self._set_controls_visible(False)
+
+    def _set_controls_visible(self, visible: bool) -> None:
+        if visible == self._controls_visible:
+            return
+        self._controls_visible = visible
+        self._controls_anim.stop()
+        if visible:
+            self.controls_overlay.show()
+            self.controls_overlay.raise_()
+        self._controls_geometry_anim.setStartValue(self.controls_overlay.geometry())
+        self._controls_geometry_anim.setEndValue(self._controls_rect(visible))
+        self._controls_opacity_anim.setStartValue(float(self._fx.opacity()))
+        self._controls_opacity_anim.setEndValue(1.0 if visible else 0.0)
+        for anim in (self._controls_opacity_anim, self._controls_geometry_anim):
+            anim.setDuration(240 if visible else 180)
+        self._controls_anim.start()
+
+    def _on_controls_anim_done(self) -> None:
+        if float(self._fx.opacity()) < 0.05:
+            self.controls_overlay.hide()
+
+    # ── Bank loading ─────────────────────────────────────────────────────
 
     def on_load_clicked(self) -> None:
         path = self.bank_edit.text().strip()
@@ -355,13 +562,14 @@ class RunScreen(QWidget):
         self.slider.setRange(0, slider_max)
         self.slider.setValue(int(self.threshold * 1000))
         self.threshold_label.setText(f'threshold: {self.threshold:.3f}')
-        self.graph.set_threshold(self.threshold)
         self.status_message.emit(
             f'bank loaded: {bank.features.shape[0]} patches   threshold {self.threshold:.3f}',
             5000,
         )
-        if self.video_label.text():  # placeholder text still showing
+        if self.video_label.text():
             self.video_label.setText('Press Start to begin live inference.')
+
+    # ── Inference control ────────────────────────────────────────────────
 
     def on_start_clicked(self) -> None:
         if self.bank is None:
@@ -374,11 +582,9 @@ class RunScreen(QWidget):
             return
         if self.bank is None:
             return
-        self.graph.reset()
         self.worker = InferenceWorker(
             self.extractor, self.bank, self.device,
-            self.cam_spin.value(), self.ema, self.blend,
-            self.threshold,
+            self.cam_spin.value(), self.ema, self.blend, self.threshold,
         )
         self.worker.set_show_heat(self.heat_btn.isChecked())
         self.worker.set_show_grid(self.grid_btn.isChecked())
@@ -410,6 +616,8 @@ class RunScreen(QWidget):
         self.stop_btn.setEnabled(False)
         self.load_btn.setEnabled(True)
         self.cam_spin.setEnabled(True)
+        self._set_info_panel_visible(False)
+        self._set_controls_visible(False)
         self.thread = None
         self.worker = None
 
@@ -417,27 +625,45 @@ class RunScreen(QWidget):
     def _on_worker_error(self, msg: str) -> None:
         self.error.emit(msg)
 
-    @pyqtSlot(QImage, float, float)
-    def on_frame(self, qimg: QImage, raw: float, ema: float) -> None:
-        self.last_qimg = qimg
-        pix = QPixmap.fromImage(qimg).scaled(
+    # ── Frame / FPS slots ────────────────────────────────────────────────
+
+    @pyqtSlot(QImage, object, float, float, bool)
+    def on_frame(
+        self,
+        main_qimg: QImage,
+        anomaly_data: list[tuple[QImage, float]],
+        raw: float,
+        ema: float,
+        has_duck: bool,
+    ) -> None:
+        self.last_qimg = main_qimg
+        pix = QPixmap.fromImage(main_qimg).scaled(
             self.video_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
         self.video_label.setPixmap(pix)
         self.video_label.setText('')
-        self.score_label.setText(f'raw:  {raw:6.3f}\nema:  {ema:6.3f}')
-        self.graph.append(raw, ema)
+
+        for i, card in enumerate(self._duck_cards):
+            if i < len(anomaly_data):
+                qimg, score = anomaly_data[i]
+                card.update_duck(i, qimg, score)
+            else:
+                card.clear()
+
+        has_anomaly = bool(anomaly_data)
+        self._set_info_panel_visible(has_anomaly)
 
     @pyqtSlot(float)
     def on_fps(self, fps: float) -> None:
         self.status_message.emit(f'fps: {fps:4.1f}', 2000)
 
+    # ── Controls ─────────────────────────────────────────────────────────
+
     def on_slider(self, value: int) -> None:
         self.threshold = value / 1000.0
         self.threshold_label.setText(f'threshold: {self.threshold:.3f}')
-        self.graph.set_threshold(self.threshold)
         if self.worker is not None:
             self.worker.set_threshold(self.threshold)
 

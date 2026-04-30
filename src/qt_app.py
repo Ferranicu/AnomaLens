@@ -1,7 +1,7 @@
 """PyQt6 desktop app — capture, train, and run anomaly detection in one window."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEasingCurve, QEvent, Qt, QParallelAnimationGroup, QPropertyAnimation
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -26,6 +26,7 @@ CAPTURE_IDX = 0
 TRAIN_IDX = 1
 RUN_IDX = 2
 ANOMALIES_IDX = 3
+SIDEBAR_WIDTH = 128
 
 _STYLE = """
 QWidget {
@@ -160,8 +161,10 @@ class MainWindow(QMainWindow):
         self.train_screen.bank_saved.connect(self._on_bank_saved)
 
         self._build_ui()
+        self._setup_sidebar_animation()
         self.statusBar().showMessage(f'device: {self.device}   ready')
         self._switch_to(CAPTURE_IDX)
+        self.setMouseTracking(True)
 
     def _build_ui(self) -> None:
         self.stack = QStackedWidget()
@@ -193,20 +196,63 @@ class MainWindow(QMainWindow):
         )
         nav.addWidget(wordmark)
 
-        sidebar = QWidget()
-        sidebar.setLayout(nav)
-        sidebar.setFixedWidth(128)
-        sidebar.setStyleSheet('background: #13131a; border-right: 1px solid #22222e;')
+        self.sidebar = QWidget()
+        self.sidebar.setLayout(nav)
+        self.sidebar.setFixedWidth(SIDEBAR_WIDTH)
+        self.sidebar.setStyleSheet('background: #13131a; border-right: 1px solid #22222e;')
 
         root = QHBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(sidebar)
+        root.addWidget(self.sidebar)
         root.addWidget(self.stack, stretch=1)
 
         central = QWidget()
         central.setLayout(root)
+        central.setMouseTracking(True)
         self.setCentralWidget(central)
+        self.stack.setMouseTracking(True)
+        self.stack.installEventFilter(self)
+        self.run_screen.installEventFilter(self)
+        self.run_screen.video_label.installEventFilter(self)
+
+    def _setup_sidebar_animation(self) -> None:
+        self._sidebar_visible = True
+        self._sidebar_anim = QParallelAnimationGroup(self)
+        self._sidebar_min_anim = QPropertyAnimation(self.sidebar, b'minimumWidth', self)
+        self._sidebar_max_anim = QPropertyAnimation(self.sidebar, b'maximumWidth', self)
+        for anim in (self._sidebar_min_anim, self._sidebar_max_anim):
+            anim.setDuration(240)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._sidebar_anim.addAnimation(anim)
+
+    def _set_sidebar_visible(self, visible: bool) -> None:
+        if visible == self._sidebar_visible:
+            return
+        self._sidebar_visible = visible
+        self._sidebar_anim.stop()
+        start = max(self.sidebar.width(), 0)
+        target = SIDEBAR_WIDTH if visible else 0
+        if visible:
+            self.sidebar.show()
+        for anim in (self._sidebar_min_anim, self._sidebar_max_anim):
+            anim.setStartValue(start)
+            anim.setEndValue(target)
+        self._sidebar_anim.start()
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseMove and self.stack.currentIndex() == RUN_IDX:
+            global_pos = (
+                event.globalPosition().toPoint()
+                if hasattr(event, 'globalPosition')
+                else event.globalPos()
+            )
+            pos = self.mapFromGlobal(global_pos)
+            if pos.x() <= 12:
+                self._set_sidebar_visible(True)
+            elif self._sidebar_visible and pos.x() > SIDEBAR_WIDTH + 96:
+                self._set_sidebar_visible(False)
+        return super().eventFilter(obj, event)
 
     def _make_nav_btn(self, label: str, index: int) -> QPushButton:
         btn = QPushButton(label)
@@ -230,6 +276,7 @@ class MainWindow(QMainWindow):
             self.anomalies_screen.refresh()
 
         self.stack.setCurrentIndex(index)
+        self._set_sidebar_visible(index != RUN_IDX)
         btn = self.nav_group.button(index)
         if btn is not None:
             btn.setChecked(True)
