@@ -1,4 +1,4 @@
-"""Duck detection via HSV color segmentation for Engisoft blue PVC ducks."""
+"""Duck detection via HSV color segmentation for blue PVC ducks."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -41,7 +41,7 @@ def detect_ducks(
     bgr: np.ndarray,
     params: DetectorParams = _DEFAULT_PARAMS,
 ) -> list[DuckBox]:
-    """HSV-based detection of Engisoft blue PVC ducks.
+    """HSV-based detection of blue PVC ducks.
 
     Returns a list of bounding boxes sorted by area descending (largest duck first).
     Returns empty list if no ducks are found.

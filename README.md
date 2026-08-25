@@ -1,8 +1,14 @@
 # PatoInspector
 
-Webcam anomaly detection POC for the factory fair. Trains on "good" Engisoft blue PVC ducks, flags ducks with defects (e.g. flawed eye) in real time.
+Webcam anomaly detection with a hand-rolled [PatchCore](https://arxiv.org/abs/2106.08265)
+implementation: train only on *good* samples (cold-start — no defect examples
+needed), then flag defective ones live. Demo subject: spotting flawed eyes on
+blue PVC ducks.
 
-Uses a minimal PatchCore implementation (WideResNet50 patch features + coreset memory bank + nearest-neighbor scoring). No anomaly samples needed for training — cold-start.
+Two frontends share one engine (`src/engine.py`):
+
+- **CLI** — plain OpenCV windows (`pato-capture`, `pato-train`, `pato-run`)
+- **Desktop app** — PyQt6, with capture / train / run / anomaly-browser screens (`pato-app`)
 
 ## Setup
 
@@ -10,31 +16,81 @@ Uses a minimal PatchCore implementation (WideResNet50 patch features + coreset m
 python -m venv .venv
 .venv\Scripts\activate      # Windows
 # source .venv/bin/activate  # macOS/Linux
-pip install -r requirements.txt
+pip install -e .
 ```
 
-First run downloads WideResNet50 weights (~260MB) to the torch hub cache.
+First run downloads WideResNet50 weights (~260 MB) into the torch hub cache.
+CPU-only machines work; a GPU speeds up feature extraction and coreset.
 
-## Flow
+On Windows, cameras open through OpenCV's DirectShow backend automatically
+(faster startup than the default MSMF); other platforms use the default backend.
 
-1. **Capture good samples** — point camera at good ducks, press SPACE to snap, ESC to finish.
+## Quickstart (CLI)
+
+1. **Capture good samples** — SPACE snaps every detected duck as its own crop,
+   ESC quits.
    ```bash
-   python scripts/capture.py --out dataset/good --count 40
+   pato-capture --out dataset/good --count 40
    ```
 
-2. **Build memory bank** — extract features, coreset-subsample, save.
+2. **Build the memory bank** — extract patch features, subsample with greedy
+   k-center coreset, calibrate a default threshold from the training scores.
    ```bash
-   python scripts/train.py --data dataset/good --out models/bank.pt
+   pato-train --data dataset/good --out models/bank.pt --coreset-ratio 0.10 --batch 8
    ```
 
-3. **Run live inference** — heatmap overlay + OK/ANOMALY badge.
+3. **Run live inference** — JET heatmap overlay + OK/ANOMALY badge per duck.
    ```bash
-   python scripts/run.py --bank models/bank.pt
+   pato-run --bank models/bank.pt --camera 0 --blend 0.5 --ema 0.4
    ```
-   Adjust the threshold on the fly with `[` / `]` keys. Press `s` to save a snapshot, `q` to quit.
+   Keys: `[` / `]` lower/raise threshold, `h` heatmap on/off, `g` patch grid,
+   `s` save snapshot to `snapshots/`, `q` quit.
 
-## Tips for a good demo
+The same commands also work as plain scripts: `python scripts/capture.py ...`,
+`python scripts/train.py ...`, `python scripts/run.py ...`.
 
-- Keep the camera framing consistent between capture and inference (same distance / background / lighting).
-- 30–50 good-duck captures from varied angles is usually plenty.
-- If everything looks anomalous, loosen the threshold (`]`). If nothing triggers on the flawed duck, tighten it (`[`).
+## Desktop app
+
+```bash
+pato-app --bank models/bank.pt --camera 0
+```
+
+Accepts the same flags as `pato-run` plus `--threshold` (override the saved
+threshold), `--blend` and `--ema`. The sidebar has four screens:
+
+- **Capture** — live preview with detection boxes; Space saves each detected duck.
+- **Train** — pick dataset/output folder, coreset ratio and batch size; watch
+  progress and live calibration patch grids.
+- **Run** — live inference with a threshold slider; anomalous ducks pop up as
+  zoomed cards in the side panel and get logged to `anomalies/`.
+- **Anomalies** — browse or clear logged anomaly events.
+
+<!-- Screenshots TODO:
+     - docs/screenshots/app-run.png    desktop app, Run screen with anomaly cards
+     - docs/screenshots/cli-run.png    CLI heatmap overlay + OK/ANOMALY badge
+-->
+
+## How it works
+
+WideResNet50 `layer2`+`layer3` features are concatenated per patch,
+neighborhood-aggregated, then subsampled by greedy farthest-point coreset
+(default ratio 0.10) into a memory bank saved at `models/bank.pt`. At inference
+each patch's nearest-neighbour distance forms a 28x28 anomaly map upsampled for
+the overlay; the frame's peak score is EMA-smoothed and compared against the
+threshold. Training stores `2x` the worst training-image score as the default
+threshold — tune it live with `[` / `]` or the app's slider.
+
+Artifacts (`dataset/`, `models/`, `snapshots/`, `anomalies/`) are gitignored
+and created on demand.
+
+## Tests
+
+Offline, CPU-only, no pretrained downloads:
+
+```bash
+pip install pytest
+pytest -q
+```
+
+CI runs the same suite on every push/PR to `main`
+(`.github/workflows/ci.yml`, CPU-only PyTorch wheels).
