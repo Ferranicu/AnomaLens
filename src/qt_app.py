@@ -289,10 +289,7 @@ class MainWindow(QMainWindow):
 
     def _on_bank_saved(self, path: str) -> None:
         self.run_screen.bank_edit.setText(path)
-        self.run_screen._load_bank(path)
-
-    def start(self) -> None:
-        pass
+        self.run_screen.load_bank(path)
 
     def closeEvent(self, event) -> None:
         self.capture_screen.stop_camera()

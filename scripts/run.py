@@ -17,8 +17,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.duck_detector import detect_ducks, square_crop  # noqa: E402
@@ -152,7 +150,7 @@ def main() -> None:
                     cv2.putText(display, f'{duck_max:.2f}', (cx0 + 4, cy0 + cs - 8),
                                 cv2.FONT_HERSHEY_DUPLEX, 0.55, col, 1, cv2.LINE_AA)
             else:
-                ema_score = ema_score  # hold last value
+                # No detections this frame: hold the previous EMA value.
                 cv2.putText(display, 'no ducks detected', (20, 50),
                             cv2.FONT_HERSHEY_DUPLEX, 0.9, (200, 80, 80), 2, cv2.LINE_AA)
 

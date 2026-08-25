@@ -85,8 +85,8 @@ def square_crop(
 ) -> tuple[np.ndarray, tuple[int, int, int]]:
     """Square crop centered on a DuckBox with padding, clipped to frame bounds.
 
-    Returns (crop_bgr, (x0, y0, size)) — the same format as center_square_view so
-    callers can re-project heatmaps back to display coordinates unchanged.
+    Returns (crop_bgr, (x0, y0, size)) — frame coordinates so callers can
+    re-project heatmaps back to display coordinates unchanged.
     """
     cx = box.x + box.w // 2
     cy = box.y + box.h // 2

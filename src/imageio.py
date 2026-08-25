@@ -23,12 +23,3 @@ def bgr_to_tensor(bgr: np.ndarray, device: torch.device) -> torch.Tensor:
     arr = rgb.astype(np.float32) / 255.0
     t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
     return t
-
-
-def center_square_view(bgr: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int]]:
-    """Return the same center-crop we feed to the model, plus (x0, y0, size)."""
-    h, w = bgr.shape[:2]
-    s = min(h, w)
-    y0 = (h - s) // 2
-    x0 = (w - s) // 2
-    return bgr[y0:y0 + s, x0:x0 + s].copy(), (x0, y0, s)

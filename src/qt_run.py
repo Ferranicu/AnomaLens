@@ -212,12 +212,11 @@ class InferenceWorker(QObject):
 
 
 class DuckCard(QWidget):
-    """Single image-only anomaly card for the right panel."""
+    """Image-only card for a detected anomaly; always styled as an alert."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName('DuckCard')
-        self._bad = False
         self._build()
 
     def _build(self) -> None:
@@ -230,9 +229,9 @@ class DuckCard(QWidget):
         lay.setSpacing(0)
         lay.addWidget(self._zoom, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.setLayout(lay)
-        self._apply_style(ok=True)
+        self._apply_alert_style()
 
-    def update_duck(self, idx: int, qimg: QImage, score: float, is_bad: bool = True) -> None:
+    def update_duck(self, qimg: QImage) -> None:
         pix = QPixmap.fromImage(qimg).scaled(
             self._zoom.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
@@ -240,33 +239,20 @@ class DuckCard(QWidget):
         )
         self._zoom.setPixmap(pix)
         self._zoom.setText('')
-        if not self._bad:
-            self._bad = True
-            self._apply_style(ok=False)
         self.show()
 
     def clear(self) -> None:
         self.hide()
 
-    def _apply_style(self, ok: bool) -> None:
-        if ok:
-            self.setStyleSheet(
-                'QWidget#DuckCard {'
-                '  background:#111217; border:1px solid #242836; border-radius:6px;'
-                '}'
-            )
-            self._zoom.setStyleSheet(
-                'background:#08090d; border:1px solid #202434; border-radius:4px;'
-            )
-        else:
-            self.setStyleSheet(
-                'QWidget#DuckCard {'
-                '  background:#171114; border:1px solid #6b2a30; border-radius:6px;'
-                '}'
-            )
-            self._zoom.setStyleSheet(
-                'background:#09070a; border:1px solid #3f171c; border-radius:4px;'
-            )
+    def _apply_alert_style(self) -> None:
+        self.setStyleSheet(
+            'QWidget#DuckCard {'
+            '  background:#171114; border:1px solid #6b2a30; border-radius:6px;'
+            '}'
+        )
+        self._zoom.setStyleSheet(
+            'background:#09070a; border:1px solid #3f171c; border-radius:4px;'
+        )
 
 
 class RunScreen(QWidget):
@@ -303,7 +289,7 @@ class RunScreen(QWidget):
         self.setMouseTracking(True)
 
         if Path(default_bank).exists():
-            self._load_bank(default_bank)
+            self.load_bank(default_bank)
 
     # ── Build UI ─────────────────────────────────────────────────────────
 
@@ -548,9 +534,10 @@ class RunScreen(QWidget):
         if not Path(path).exists():
             self.error.emit(f'Bank not found: {path}')
             return
-        self._load_bank(path)
+        self.load_bank(path)
 
-    def _load_bank(self, path: str) -> None:
+    def load_bank(self, path: str) -> None:
+        """Load a memory bank from disk and sync the threshold slider to its saved threshold."""
         try:
             bank, meta = MemoryBank.load(path, self.device)
         except Exception as e:
@@ -648,7 +635,7 @@ class RunScreen(QWidget):
         for i, card in enumerate(self._duck_cards):
             if i < len(anomaly_data):
                 qimg, score = anomaly_data[i]
-                card.update_duck(i, qimg, score)
+                card.update_duck(qimg)
             else:
                 card.clear()
 

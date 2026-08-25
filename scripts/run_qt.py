@@ -28,7 +28,6 @@ def main() -> None:
     app = QApplication(sys.argv)
     win = MainWindow(args.bank, args.camera, args.threshold, args.ema, args.blend)
     win.show()
-    win.start()
     sys.exit(app.exec())
 
 
