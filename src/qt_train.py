@@ -1,7 +1,6 @@
 """Train screen — build a PatchCore memory bank from captured good images."""
 from __future__ import annotations
 
-import statistics
 import traceback
 from pathlib import Path
 
@@ -23,9 +22,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .duck_detector import detect_ducks, square_crop
+from .engine import (
+    bank_meta,
+    calibrate_threshold,
+    iter_calibration_batches,
+    iter_extracted_batches,
+    list_dataset_images,
+)
 from .heatmap import render_patch_grid
-from .imageio import bgr_to_tensor
 from .patchcore import INPUT_SIZE, MemoryBank, PatchFeatureExtractor, coreset_subsample
 
 
@@ -68,25 +72,14 @@ class TrainerWorker(QObject):
         blended = cv2.addWeighted(crop, 0.45, grid, 0.55, 0.0)
         self.viz_frame.emit(blended, float(score_map.min()), float(score_map.max()))
 
-    def _load_batch(self, files: list[Path]) -> torch.Tensor | None:
-        tensors = []
-        for f in files:
-            img = cv2.imread(str(f))
-            if img is None:
-                self.log.emit(f'skip unreadable: {f}')
-                continue
-            boxes = detect_ducks(img)
-            crop = square_crop(img, boxes[0])[0] if boxes else img
-            tensors.append(bgr_to_tensor(crop, self.device))
-        if not tensors:
-            return None
-        return torch.cat(tensors, dim=0)
+    def _note_unreadable(self, path: Path) -> None:
+        self.log.emit(f'skip unreadable: {path}')
 
     @pyqtSlot()
     def run(self) -> None:
         try:
             data_dir = Path(self.data_dir)
-            files = sorted(list(data_dir.glob('*.jpg')) + list(data_dir.glob('*.png')))
+            files = list_dataset_images(data_dir)
             if not files:
                 self.done.emit(False, f'no images in {data_dir}', '')
                 return
@@ -95,17 +88,14 @@ class TrainerWorker(QObject):
             self.log.emit(f'loading {n} images from {data_dir}')
 
             all_feats: list[torch.Tensor] = []
-            for i in range(0, n, self.batch):
+            for done, flat, _batch_files in iter_extracted_batches(
+                files, self.extractor, self.device, self.batch,
+                on_unreadable=self._note_unreadable,
+            ):
                 if self._stop:
                     self.done.emit(False, 'cancelled', '')
                     return
-                batch_files = files[i:i + self.batch]
-                x = self._load_batch(batch_files)
-                if x is None:
-                    continue
-                flat, _ = self.extractor.embed(x)
-                all_feats.append(flat.cpu())
-                done = i + len(batch_files)
+                all_feats.append(flat)
                 self.progress.emit(int(done / n * 50), f'extract {done}/{n}')
 
             if not all_feats:
@@ -116,31 +106,24 @@ class TrainerWorker(QObject):
             self.log.emit(f'patch embeddings: {tuple(feats.shape)}')
 
             self.progress.emit(55, f'coreset subsample (ratio={self.ratio})...')
-            feats_dev = feats.to(self.device)
-            bank_t = coreset_subsample(feats_dev, ratio=self.ratio)
+            bank_t = coreset_subsample(feats.to(self.device), ratio=self.ratio)
             self.log.emit(f'coreset: {tuple(bank_t.shape)}')
 
             mem = MemoryBank(bank_t, self.device)
 
             per_image_max: list[float] = []
-            for i in range(0, n, self.batch):
+            for done, scores, batch_files in iter_calibration_batches(
+                files, mem, self.extractor, self.device, self.batch,
+                on_unreadable=self._note_unreadable,
+            ):
                 if self._stop:
                     self.done.emit(False, 'cancelled', '')
                     return
-                batch_files = files[i:i + self.batch]
-                x = self._load_batch(batch_files)
-                if x is None:
-                    continue
-                flat, (B, H, W) = self.extractor.embed(x)
-                scores = mem.score(flat).view(B, H, W)
                 per_image_max.extend(scores.amax(dim=(1, 2)).cpu().tolist())
-                done = i + len(batch_files)
                 self.progress.emit(60 + int(done / n * 35), f'calibrate {done}/{n}')
                 self._emit_viz(batch_files[-1], scores[-1].cpu().numpy())
 
-            good_mean = statistics.fmean(per_image_max)
-            good_max = max(per_image_max)
-            default_thresh = good_max * 2.0
+            good_mean, good_max, default_thresh = calibrate_threshold(per_image_max)
             self.log.emit(
                 f'good_max={good_max:.3f}  good_mean={good_mean:.3f}  '
                 f'threshold={default_thresh:.3f}'
@@ -148,12 +131,7 @@ class TrainerWorker(QObject):
 
             out_path = Path(self.out_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            mem.save(str(out_path), meta={
-                'threshold': default_thresh,
-                'good_max': good_max,
-                'good_mean': good_mean,
-                'n_train': n,
-            })
+            mem.save(str(out_path), meta=bank_meta(n, good_mean, good_max))
             self.progress.emit(100, 'saved')
             self.log.emit(f'saved {out_path}')
             self.done.emit(True, f'saved {out_path}  (threshold {default_thresh:.3f})', str(out_path))

@@ -5,6 +5,7 @@ Controls:
   [   lower threshold (more sensitive)
   ]   raise threshold (less sensitive)
   h   toggle heatmap overlay
+  g   toggle patch grid overlay
   s   save snapshot to snapshots/
   q   quit
 """
@@ -18,9 +19,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from src.duck_detector import detect_ducks, square_crop
-from src.heatmap import render_heatmap, render_patch_grid
-from src.imageio import bgr_to_tensor, open_camera
+from src.engine import (
+    detect_and_score,
+    draw_duck_overlays,
+    is_anomaly,
+    update_ema,
+)
+from src.imageio import open_camera
 from src.patchcore import MemoryBank, PatchFeatureExtractor, pick_device
 
 
@@ -112,48 +117,25 @@ def main() -> None:
             fps = 0.9 * fps + 0.1 * inst_fps if fps else inst_fps
 
             display = frame.copy()
-            boxes = detect_ducks(frame)
-            max_score = 0.0
+            results = detect_and_score(frame, extractor, bank)
             is_anom = False
 
-            if boxes:
-                duck_results = []
-                for box in boxes:
-                    crop, (cx0, cy0, cs) = square_crop(frame, box)
-                    x = bgr_to_tensor(crop, device)
-                    flat, (B, H, W) = extractor.embed(x)
-                    score_map = bank.score(flat).view(H, W).cpu().numpy()
-                    duck_results.append(((cx0, cy0, cs), score_map))
-
-                max_score = max(float(sm.max()) for _, sm in duck_results)
-                if ema_score is None:
-                    ema_score = max_score
-                else:
-                    ema_score = ema * ema_score + (1.0 - ema) * max_score
-                is_anom = ema_score > threshold
-
-                for (cx0, cy0, cs), score_map in duck_results:
-                    if show_heat:
-                        heat = render_heatmap(score_map, cs, vmax=threshold)
-                        local = display[cy0:cy0 + cs, cx0:cx0 + cs]
-                        display[cy0:cy0 + cs, cx0:cx0 + cs] = cv2.addWeighted(
-                            local, 1.0 - args.blend, heat, args.blend, 0.0)
-                    if show_grid:
-                        grid = render_patch_grid(score_map, cs, vmax=threshold)
-                        local = display[cy0:cy0 + cs, cx0:cx0 + cs]
-                        display[cy0:cy0 + cs, cx0:cx0 + cs] = cv2.addWeighted(
-                            local, 1.0 - args.blend, grid, args.blend, 0.0)
-                    duck_max = float(score_map.max())
-                    col = COL_BAD if duck_max > threshold else COL_OK
-                    cv2.rectangle(display, (cx0, cy0), (cx0 + cs, cy0 + cs), col, 3)
-                    cv2.putText(display, f'{duck_max:.2f}', (cx0 + 4, cy0 + cs - 8),
-                                cv2.FONT_HERSHEY_DUPLEX, 0.55, col, 1, cv2.LINE_AA)
+            if results:
+                peak = max(r.max_score for r in results)
+                ema_score = update_ema(ema_score, peak, ema)
+                is_anom = is_anomaly(ema_score, threshold)
+                draw_duck_overlays(
+                    display, results, threshold,
+                    blend=args.blend, show_heat=show_heat, show_grid=show_grid,
+                    ok_color=COL_OK, bad_color=COL_BAD,
+                )
             else:
                 # No detections this frame: hold the previous EMA value.
                 cv2.putText(display, 'no ducks detected', (20, 50),
                             cv2.FONT_HERSHEY_DUPLEX, 0.9, (200, 80, 80), 2, cv2.LINE_AA)
 
-            draw_panel(display, is_anom, ema_score or 0.0, threshold, fps, show_heat, show_grid)
+            panel_score = ema_score if ema_score is not None else 0.0
+            draw_panel(display, is_anom, panel_score, threshold, fps, show_heat, show_grid)
 
             cv2.imshow('PatoInspector — live', display)
             key = cv2.waitKey(1) & 0xFF

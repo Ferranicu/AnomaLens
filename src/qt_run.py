@@ -1,7 +1,10 @@
-"""Run screen — live PatchCore inference, fair-mode UI.
+"""Run screen — live PatchCore inference, live-mode UI.
 
 Right panel: anomaly-only live zoom cards, hidden when the frame is clean.
 Controls: edge-reveal bottom drawer with slide/fade animation.
+
+The per-frame math lives in src/engine.py; this worker adds camera capture,
+threading and signal plumbing around it.
 """
 from __future__ import annotations
 
@@ -29,9 +32,8 @@ from PyQt6.QtWidgets import (
 )
 
 from .anomaly_store import AnomalyStore
-from .duck_detector import detect_ducks, square_crop
-from .heatmap import render_heatmap, render_patch_grid
-from .imageio import bgr_to_tensor, open_camera
+from .engine import detect_and_score, draw_duck_overlays, is_anomaly, update_ema
+from .imageio import open_camera
 from .patchcore import MemoryBank, PatchFeatureExtractor
 
 
@@ -133,53 +135,33 @@ class InferenceWorker(QObject):
 
                 now = time.time()
                 display = frame.copy()
-                boxes = detect_ducks(frame)
+                results = detect_and_score(frame, self.extractor, self.bank)
                 raw_score = 0.0
                 anomaly_data: list[tuple[QImage, float, int]] = []
                 is_anom = False
 
-                if boxes:
-                    duck_results = []
-                    for box in boxes:
-                        crop, (cx0, cy0, cs) = square_crop(frame, box)
-                        x = bgr_to_tensor(crop, self.device)
-                        flat, (B, H, W) = self.extractor.embed(x)
-                        score_map = self.bank.score(flat).view(H, W).cpu().numpy()
-                        duck_results.append((box, (cx0, cy0, cs), score_map))
+                if results:
+                    raw_score = max(r.max_score for r in results)
+                    ema_score = update_ema(ema_score, raw_score, self.ema)
+                    is_anom = is_anomaly(ema_score, self.threshold)
+                    draw_duck_overlays(
+                        display, results, self.threshold,
+                        blend=self.blend,
+                        show_heat=self._show_heat, show_grid=self._show_grid,
+                    )
 
-                    raw_score = max(float(sm.max()) for _, _, sm in duck_results)
-                    if ema_score is None:
-                        ema_score = raw_score
-                    else:
-                        ema_score = self.ema * ema_score + (1.0 - self.ema) * raw_score
-                    is_anom = ema_score > self.threshold
-
-                    for _, (cx0, cy0, cs), score_map in duck_results:
-                        if self._show_heat:
-                            heat = render_heatmap(score_map, cs, vmax=self.threshold)
-                            local = display[cy0:cy0 + cs, cx0:cx0 + cs]
-                            display[cy0:cy0 + cs, cx0:cx0 + cs] = cv2.addWeighted(
-                                local, 1.0 - self.blend, heat, self.blend, 0.0)
-                        if self._show_grid:
-                            grid = render_patch_grid(score_map, cs, vmax=self.threshold)
-                            local = display[cy0:cy0 + cs, cx0:cx0 + cs]
-                            display[cy0:cy0 + cs, cx0:cx0 + cs] = cv2.addWeighted(
-                                local, 1.0 - self.blend, grid, self.blend, 0.0)
-                        duck_max = float(score_map.max())
-                        col = (50, 50, 255) if duck_max > self.threshold else (60, 180, 80)
-                        cv2.rectangle(display, (cx0, cy0), (cx0 + cs, cy0 + cs), col, 3)
-                        cv2.putText(display, f'{duck_max:.2f}', (cx0 + 4, cy0 + cs - 8),
-                                    cv2.FONT_HERSHEY_DUPLEX, 0.55, col, 1, cv2.LINE_AA)
-                        if duck_max > self.threshold:
-                            peak_crop = self._peak_zoom(frame, (cx0, cy0, cs), score_map)
+                    for result in results:
+                        if result.max_score > self.threshold:
+                            x0, _y0, cs = result.crop_box
+                            peak_crop = self._peak_zoom(frame, result.crop_box, result.score_map)
                             zoomed = cv2.resize(peak_crop, (_WORKER_ZOOM, _WORKER_ZOOM),
                                                 interpolation=cv2.INTER_LINEAR)
-                            anomaly_data.append((self._bgr_qimg(zoomed), duck_max, cx0 + cs // 2))
+                            anomaly_data.append(
+                                (self._bgr_qimg(zoomed), result.max_score, x0 + cs // 2))
 
                     if is_anom and not was_anom and (now - last_anom_t) > ANOMALY_COOLDOWN_S:
-                        worst = max(duck_results, key=lambda t: t[2].max())
-                        _, worst_crop_box, worst_score_map = worst
-                        zoom_bgr = self._peak_zoom(frame, worst_crop_box, worst_score_map)
+                        worst = max(results, key=lambda r: r.max_score)
+                        zoom_bgr = self._peak_zoom(frame, worst.crop_box, worst.score_map)
                         self.anomaly_detected.emit(
                             display.copy(), zoom_bgr,
                             float(ema_score), float(self.threshold), now,
@@ -198,7 +180,7 @@ class InferenceWorker(QObject):
                     [(qimg, score) for qimg, score, _center_x in anomaly_data],
                     raw_score,
                     ema_out,
-                    bool(boxes),
+                    bool(results),
                 )
 
                 fps_frames += 1

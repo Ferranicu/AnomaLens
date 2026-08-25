@@ -8,11 +8,15 @@ import sys
 import time
 from pathlib import Path
 
-import cv2
 import torch
 
-from src.duck_detector import detect_ducks, square_crop
-from src.imageio import bgr_to_tensor
+from src.engine import (
+    bank_meta,
+    calibrate_threshold,
+    iter_calibration_batches,
+    iter_extracted_batches,
+    list_dataset_images,
+)
 from src.patchcore import MemoryBank, PatchFeatureExtractor, coreset_subsample, pick_device
 
 
@@ -25,7 +29,7 @@ def main() -> None:
     args = ap.parse_args()
 
     data_dir = Path(args.data)
-    files = sorted(list(data_dir.glob('*.jpg')) + list(data_dir.glob('*.png')))
+    files = list_dataset_images(data_dir)
     if not files:
         print(f'ERROR: no images in {data_dir}', file=sys.stderr)
         sys.exit(1)
@@ -38,23 +42,12 @@ def main() -> None:
 
     all_feats: list[torch.Tensor] = []
     t0 = time.time()
-    for i in range(0, len(files), args.batch):
-        batch_files = files[i:i + args.batch]
-        tensors = []
-        for f in batch_files:
-            img = cv2.imread(str(f))
-            if img is None:
-                print(f'skip unreadable: {f}')
-                continue
-            boxes = detect_ducks(img)
-            crop = square_crop(img, boxes[0])[0] if boxes else img
-            tensors.append(bgr_to_tensor(crop, device))
-        if not tensors:
-            continue
-        x = torch.cat(tensors, dim=0)
-        flat, (B, H, W) = extractor.embed(x)
-        all_feats.append(flat.cpu())
-        print(f'  [{i + len(batch_files)}/{len(files)}] extracted ({flat.shape[0]} patches)')
+    for done, flat, _batch in iter_extracted_batches(
+        files, extractor, device, args.batch,
+        on_unreadable=lambda f: print(f'skip unreadable: {f}'),
+    ):
+        all_feats.append(flat)
+        print(f'  [{done}/{len(files)}] extracted ({flat.shape[0]} patches)')
 
     feats = torch.cat(all_feats, dim=0)
     print(f'total patch embeddings: {feats.shape} in {time.time() - t0:.1f}s')
@@ -62,8 +55,7 @@ def main() -> None:
     print(f'coreset subsample (ratio={args.coreset_ratio})...')
     t0 = time.time()
     # Move to GPU for speed if available
-    feats_dev = feats.to(device)
-    bank = coreset_subsample(feats_dev, ratio=args.coreset_ratio)
+    bank = coreset_subsample(feats.to(device), ratio=args.coreset_ratio)
     print(f'coreset: {bank.shape} in {time.time() - t0:.1f}s')
 
     mem = MemoryBank(bank, device)
@@ -73,38 +65,18 @@ def main() -> None:
     #  tune at runtime with [/] keys.)
     print('calibrating threshold on training set...')
     per_image_max: list[float] = []
-    for i in range(0, len(files), args.batch):
-        batch_files = files[i:i + args.batch]
-        tensors = []
-        for f in batch_files:
-            img = cv2.imread(str(f))
-            if img is None:
-                continue
-            boxes = detect_ducks(img)
-            crop = square_crop(img, boxes[0])[0] if boxes else img
-            tensors.append(bgr_to_tensor(crop, device))
-        if not tensors:
-            continue
-        x = torch.cat(tensors, dim=0)
-        flat, (B, H, W) = extractor.embed(x)
-        scores = mem.score(flat).view(B, H, W)
+    for _done, scores, _batch in iter_calibration_batches(
+        files, mem, extractor, device, args.batch,
+        on_unreadable=lambda f: print(f'skip unreadable: {f}'),
+    ):
         per_image_max.extend(scores.amax(dim=(1, 2)).cpu().tolist())
-    import statistics
-    good_mean = statistics.fmean(per_image_max)
-    good_max = max(per_image_max)
-    # Default threshold: 2x the max good-image score. Users will tune live.
-    default_thresh = good_max * 2.0
+    good_mean, good_max, default_thresh = calibrate_threshold(per_image_max)
     print(f'  good max-scores: mean={good_mean:.3f} max={good_max:.3f}')
     print(f'  suggested threshold: {default_thresh:.3f}')
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    mem.save(str(out_path), meta={
-        'threshold': default_thresh,
-        'good_max': good_max,
-        'good_mean': good_mean,
-        'n_train': len(files),
-    })
+    mem.save(str(out_path), meta=bank_meta(len(files), good_mean, good_max))
     print(f'saved {out_path}')
 
 
