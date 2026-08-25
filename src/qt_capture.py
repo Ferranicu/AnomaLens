@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .duck_detector import detect_ducks, square_crop
+from .imageio import open_camera
 
 
 class CaptureWorker(QObject):
@@ -35,7 +36,7 @@ class CaptureWorker(QObject):
 
     @pyqtSlot()
     def run(self) -> None:
-        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        cap = open_camera(self.camera_index)
         if not cap.isOpened():
             self.error.emit('Cannot open camera')
             self.finished.emit()

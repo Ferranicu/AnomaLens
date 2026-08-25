@@ -1,11 +1,24 @@
-"""Image preprocessing shared by capture / train / run."""
+"""Image preprocessing and camera helpers shared by capture / train / run."""
 from __future__ import annotations
+
+import sys
 
 import cv2
 import numpy as np
 import torch
 
 from .patchcore import INPUT_SIZE
+
+
+def open_camera(index: int) -> cv2.VideoCapture:
+    """Open webcam `index`, using the DirectShow backend on Windows.
+
+    CAP_DSHOW avoids the multi-second MSMF startup probe on Windows but does
+    not exist on other platforms, which get OpenCV's default backend.
+    """
+    if sys.platform.startswith('win'):
+        return cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    return cv2.VideoCapture(index)
 
 
 def bgr_to_tensor(bgr: np.ndarray, device: torch.device) -> torch.Tensor:

@@ -20,7 +20,7 @@ import numpy as np
 
 from src.duck_detector import detect_ducks, square_crop
 from src.heatmap import render_heatmap, render_patch_grid
-from src.imageio import bgr_to_tensor
+from src.imageio import bgr_to_tensor, open_camera
 from src.patchcore import MemoryBank, PatchFeatureExtractor, pick_device
 
 
@@ -82,7 +82,7 @@ def main() -> None:
     threshold = args.threshold if args.threshold is not None else meta.get('threshold', 1.0)
     print(f'bank: {bank.features.shape[0]} patches | threshold: {threshold:.3f}')
 
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+    cap = open_camera(args.camera)
     if not cap.isOpened():
         print('ERROR: cannot open camera', file=sys.stderr)
         sys.exit(1)

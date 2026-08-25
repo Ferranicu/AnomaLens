@@ -17,6 +17,7 @@ from pathlib import Path
 import cv2
 
 from src.duck_detector import detect_ducks, square_crop
+from src.imageio import open_camera
 
 
 def main() -> None:
@@ -32,7 +33,7 @@ def main() -> None:
     idx = len(existing)
     print(f'writing to {out_dir} (starting at index {idx})')
 
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+    cap = open_camera(args.camera)
     if not cap.isOpened():
         print('ERROR: cannot open camera', file=sys.stderr)
         sys.exit(1)

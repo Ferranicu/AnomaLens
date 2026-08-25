@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 from .anomaly_store import AnomalyStore
 from .duck_detector import detect_ducks, square_crop
 from .heatmap import render_heatmap, render_patch_grid
-from .imageio import bgr_to_tensor
+from .imageio import bgr_to_tensor, open_camera
 from .patchcore import MemoryBank, PatchFeatureExtractor
 
 
@@ -111,7 +111,7 @@ class InferenceWorker(QObject):
 
     @pyqtSlot()
     def run(self) -> None:
-        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        cap = open_camera(self.camera_index)
         if not cap.isOpened():
             self.error.emit('Cannot open camera')
             self.finished.emit()

@@ -139,7 +139,7 @@ class MemoryBank:
 
     @classmethod
     def load(cls, path: str, device: torch.device) -> tuple['MemoryBank', dict]:
-        obj = torch.load(path, map_location='cpu')
+        obj = torch.load(path, map_location='cpu', weights_only=True)
         meta = obj.get('meta', {}) if isinstance(obj, dict) else {}
         return cls(obj['features'], device), meta
 
