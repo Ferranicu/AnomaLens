@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from PyQt6.QtWidgets import QApplication  # noqa: E402
+from PyQt6.QtWidgets import QApplication
 
-from src.qt_app import MainWindow  # noqa: E402
+from src.qt_app import MainWindow
 
 
 def main() -> None:

@@ -16,8 +16,7 @@ from pathlib import Path
 
 import cv2
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.duck_detector import detect_ducks, square_crop  # noqa: E402
+from src.duck_detector import detect_ducks, square_crop
 
 
 def main() -> None:

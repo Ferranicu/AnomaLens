@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patoinspector"
+version = "0.1.0"
+description = "Webcam anomaly detection with a minimal PatchCore implementation (OpenCV CLI and PyQt6 frontends)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+    "PyQt6>=6.6",
+]
+
+[project.scripts]
+pato-capture = "scripts.capture:main"
+pato-train = "scripts.train:main"
+pato-run = "scripts.run:main"
+pato-app = "scripts.run_qt:main"
+
+[tool.setuptools]
+packages = ["src", "scripts"]

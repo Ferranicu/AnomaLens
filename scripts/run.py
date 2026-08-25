@@ -18,14 +18,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.duck_detector import detect_ducks, square_crop  # noqa: E402
-from src.heatmap import render_heatmap, render_patch_grid  # noqa: E402
-from src.imageio import bgr_to_tensor  # noqa: E402
-from src.patchcore import MemoryBank, PatchFeatureExtractor, pick_device  # noqa: E402
+from src.duck_detector import detect_ducks, square_crop
+from src.heatmap import render_heatmap, render_patch_grid
+from src.imageio import bgr_to_tensor
+from src.patchcore import MemoryBank, PatchFeatureExtractor, pick_device
 
 
-# Engisoft palette (BGR for OpenCV)
+# UI palette (BGR for OpenCV)
 COL_OK    = (60, 180, 80)      # green
 COL_BAD   = (50, 50, 255)      # red
 COL_INK   = (20, 20, 20)

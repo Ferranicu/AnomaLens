@@ -11,10 +11,9 @@ from pathlib import Path
 import cv2
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.duck_detector import detect_ducks, square_crop  # noqa: E402
-from src.imageio import bgr_to_tensor  # noqa: E402
-from src.patchcore import MemoryBank, PatchFeatureExtractor, coreset_subsample, pick_device  # noqa: E402
+from src.duck_detector import detect_ducks, square_crop
+from src.imageio import bgr_to_tensor
+from src.patchcore import MemoryBank, PatchFeatureExtractor, coreset_subsample, pick_device
 
 
 def main() -> None:
