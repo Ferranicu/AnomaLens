@@ -73,14 +73,22 @@ class AnomalyStore:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                full_path = self.root / rec['full']
-                zoom_path = self.root / rec['zoom']
+                if not isinstance(rec, dict):
+                    continue
+                try:
+                    full_path = self.root / rec['full']
+                    zoom_path = self.root / rec['zoom']
+                    ts = float(rec['ts'])
+                    score = float(rec['score'])
+                    threshold = float(rec['threshold'])
+                except (KeyError, TypeError):
+                    continue
                 if not full_path.exists() or not zoom_path.exists():
                     continue
                 events.append(AnomalyEvent(
-                    ts=float(rec['ts']),
-                    score=float(rec['score']),
-                    threshold=float(rec['threshold']),
+                    ts=ts,
+                    score=score,
+                    threshold=threshold,
                     full_path=full_path,
                     zoom_path=zoom_path,
                 ))
