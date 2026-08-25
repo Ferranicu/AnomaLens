@@ -1,4 +1,4 @@
-# PatoInspector
+# AnomaLens
 
 Webcam anomaly detection with a hand-rolled [PatchCore](https://arxiv.org/abs/2106.08265)
 implementation: train only on *good* samples (cold-start — no defect examples
