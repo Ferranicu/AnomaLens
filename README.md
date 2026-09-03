@@ -65,11 +65,6 @@ threshold), `--blend` and `--ema`. The sidebar has four screens:
   zoomed cards in the side panel and get logged to `anomalies/`.
 - **Anomalies** — browse or clear logged anomaly events.
 
-<!-- Screenshots TODO:
-     - docs/screenshots/app-run.png    desktop app, Run screen with anomaly cards
-     - docs/screenshots/cli-run.png    CLI heatmap overlay + OK/ANOMALY badge
--->
-
 ## How it works
 
 WideResNet50 `layer2`+`layer3` features are concatenated per patch,
